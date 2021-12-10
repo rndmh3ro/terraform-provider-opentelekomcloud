@@ -297,6 +297,7 @@ func TestAccCCENodesV3EncryptedVolume(t *testing.T) {
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckCCENodeV3Exists(resourceNameNode, shared.DataSourceClusterName, &node),
 					resource.TestCheckResourceAttr(resourceNameNode, "data_volumes.0.kms_id", env.OS_KMS_ID),
+					resource.TestCheckResourceAttr(resourceNameNode, "root_volume.kms_id", env.OS_KMS_ID),
 				),
 			},
 		},
@@ -720,12 +721,13 @@ resource "opentelekomcloud_cce_node_v3" "node_1" {
   root_volume {
     size       = 40
     volumetype = "SATA"
+    kms_id     = "%[4]s"
   }
 
   data_volumes {
     size       = 100
     volumetype = "SATA"
-    kms_id     = "%s"
+    kms_id     = "%[4]s"
   }
 }
 `, shared.DataSourceCluster, env.OS_AVAILABILITY_ZONE, env.OS_KEYPAIR_NAME, env.OS_KMS_ID)
