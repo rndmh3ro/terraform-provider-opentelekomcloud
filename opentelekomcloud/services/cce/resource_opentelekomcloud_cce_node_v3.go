@@ -139,6 +139,11 @@ func ResourceCCENodeV3() *schema.Resource {
 							Required: true,
 							ForceNew: true,
 						},
+						"kms_id": {
+							Type:     schema.TypeString,
+							Optional: true,
+							ForceNew: true,
+						},
 						"extend_param": {
 							Type:     schema.TypeString,
 							Optional: true,
@@ -423,14 +428,21 @@ func resourceCCEDataVolume(d *schema.ResourceData) []nodes.VolumeSpec {
 }
 
 func resourceCCERootVolume(d *schema.ResourceData) nodes.VolumeSpec {
-	var nics nodes.VolumeSpec
-	nicsRaw := d.Get("root_volume").([]interface{})
-	if len(nicsRaw) == 1 {
-		nics.Size = nicsRaw[0].(map[string]interface{})["size"].(int)
-		nics.VolumeType = nicsRaw[0].(map[string]interface{})["volumetype"].(string)
-		nics.ExtendParam = nicsRaw[0].(map[string]interface{})["extend_param"].(string)
+	var rootVolume nodes.VolumeSpec
+	rootRaw := d.Get("root_volume").([]interface{})
+	if len(rootRaw) == 1 {
+		rawMap := rootRaw[0].(map[string]interface{})
+		rootVolume.Size = rawMap["size"].(int)
+		rootVolume.VolumeType = rawMap["volumetype"].(string)
+		rootVolume.ExtendParam = rawMap["extend_param"].(string)
+		if kmsID := rawMap["kms_id"]; kmsID != "" {
+			rootVolume.Metadata = map[string]interface{}{
+				"__system__cmkid":     kmsID,
+				"__system__encrypted": "1",
+			}
+		}
 	}
-	return nics
+	return rootVolume
 }
 
 func resourceCCEEipIDs(d *schema.ResourceData) []string {
@@ -444,7 +456,9 @@ func resourceCCEEipIDs(d *schema.ResourceData) []string {
 
 func resourceCCENodeV3Create(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	config := meta.(*cfg.Config)
-	client, err := config.CceV3Client(config.GetRegion(d))
+	client, err := common.ClientFromCtx(ctx, keyClient, func() (*golangsdk.ServiceClient, error) {
+		return config.CceV3Client(config.GetRegion(d))
+	})
 	if err != nil {
 		return fmterr.Errorf(cceClientError, err)
 	}
@@ -583,15 +597,20 @@ func resourceCCENodeV3Create(ctx context.Context, d *schema.ResourceData, meta i
 	}
 
 	d.SetId(nodeID)
-	return resourceCCENodeV3Read(ctx, d, meta)
+
+	clientCtx := common.CtxWithClient(ctx, client, keyClient)
+	return resourceCCENodeV3Read(clientCtx, d, meta)
 }
 
-func resourceCCENodeV3Read(_ context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
+func resourceCCENodeV3Read(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	config := meta.(*cfg.Config)
-	client, err := config.CceV3Client(config.GetRegion(d))
+	client, err := common.ClientFromCtx(ctx, keyClient, func() (*golangsdk.ServiceClient, error) {
+		return config.CceV3Client(config.GetRegion(d))
+	})
 	if err != nil {
 		return fmterr.Errorf(cceClientError, err)
 	}
+
 	clusterID := d.Get("cluster_id").(string)
 	node, err := nodes.Get(client, clusterID, d.Id()).Extract()
 	if err != nil {
@@ -603,6 +622,27 @@ func resourceCCENodeV3Read(_ context.Context, d *schema.ResourceData, meta inter
 	}
 
 	serverID := node.Status.ServerID
+
+	var volumes []map[string]interface{}
+	for _, dataVolume := range node.Spec.DataVolumes {
+		volume := make(map[string]interface{})
+		volume["size"] = dataVolume.Size
+		volume["volumetype"] = dataVolume.VolumeType
+		volume["extend_param"] = dataVolume.ExtendParam
+		if dataVolume.Metadata != nil {
+			volume["kms_id"] = dataVolume.Metadata["__system__cmkid"]
+		}
+		volumes = append(volumes, volume)
+	}
+	rootVolume := []map[string]interface{}{
+		{
+			"size":         node.Spec.RootVolume.Size,
+			"volumetype":   node.Spec.RootVolume.VolumeType,
+			"extend_param": node.Spec.RootVolume.ExtendParam,
+			"kms_id":       node.Spec.RootVolume.Metadata["__system__cmkid"],
+		},
+	}
+
 	mErr := multierror.Append(
 		d.Set("region", config.GetRegion(d)),
 		d.Set("name", node.Metadata.Name),
@@ -616,36 +656,11 @@ func resourceCCENodeV3Read(_ context.Context, d *schema.ResourceData, meta inter
 		d.Set("public_ip", node.Status.PublicIP),
 		d.Set("status", node.Status.Phase),
 		d.Set("subnet_id", node.Spec.NodeNicSpec.PrimaryNic.SubnetId),
+		d.Set("data_volumes", volumes),
+		d.Set("root_volume", rootVolume),
 	)
 	if err := mErr.ErrorOrNil(); err != nil {
 		return fmterr.Errorf("[DEBUG] Error saving main conf to state for OpenTelekomCloud Node (%s): %w", d.Id(), err)
-	}
-
-	var volumes []map[string]interface{}
-	for _, dataVolume := range node.Spec.DataVolumes {
-		volume := make(map[string]interface{})
-		volume["size"] = dataVolume.Size
-		volume["volumetype"] = dataVolume.VolumeType
-		volume["extend_param"] = dataVolume.ExtendParam
-		if dataVolume.Metadata != nil {
-			volume["kms_id"] = dataVolume.Metadata["__system__cmkid"]
-		}
-		volumes = append(volumes, volume)
-	}
-	if err := d.Set("data_volumes", volumes); err != nil {
-		return fmterr.Errorf("[DEBUG] Error saving dataVolumes to state for OpenTelekomCloud Node (%s): %w", d.Id(), err)
-	}
-
-	rootVolume := []map[string]interface{}{
-		{
-			"size":         node.Spec.RootVolume.Size,
-			"volumetype":   node.Spec.RootVolume.VolumeType,
-			"extend_param": node.Spec.RootVolume.ExtendParam,
-		},
-	}
-
-	if err := d.Set("root_volume", rootVolume); err != nil {
-		return fmterr.Errorf("[DEBUG] Error saving root Volume to state for OpenTelekomCloud Node (%s): %w", d.Id(), err)
 	}
 
 	// fetch tags from ECS instance
@@ -682,6 +697,7 @@ func setK8sNodeFields(d *schema.ResourceData, config *cfg.Config, clusterID, pri
 	if err != nil {
 		return fmt.Errorf("error creating OpenTelekomCloud CCEv1 client: %w", err)
 	}
+
 	k8Node, err := nodesv1.Get(v1Client, clusterID, privateIP).Extract()
 	if err != nil {
 		log.Printf("[WARN] error retrieving CCE node: %s", err.Error())
@@ -713,7 +729,9 @@ func setK8sNodeFields(d *schema.ResourceData, config *cfg.Config, clusterID, pri
 
 func resourceCCENodeV3Update(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	config := meta.(*cfg.Config)
-	client, err := config.CceV3Client(config.GetRegion(d))
+	client, err := common.ClientFromCtx(ctx, keyClient, func() (*golangsdk.ServiceClient, error) {
+		return config.CceV3Client(config.GetRegion(d))
+	})
 	if err != nil {
 		return fmterr.Errorf(cceClientError, err)
 	}
@@ -795,15 +813,19 @@ func resourceCCENodeV3Update(ctx context.Context, d *schema.ResourceData, meta i
 		}
 	}
 
-	return resourceCCENodeV3Read(ctx, d, meta)
+	clientCtx := common.CtxWithClient(ctx, client, keyClient)
+	return resourceCCENodeV3Read(clientCtx, d, meta)
 }
 
 func resourceCCENodeV3Delete(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	config := meta.(*cfg.Config)
-	client, err := config.CceV3Client(config.GetRegion(d))
+	client, err := common.ClientFromCtx(ctx, keyClient, func() (*golangsdk.ServiceClient, error) {
+		return config.CceV3Client(config.GetRegion(d))
+	})
 	if err != nil {
 		return fmterr.Errorf(cceClientError, err)
 	}
+
 	clusterID := d.Get("cluster_id").(string)
 	if err := nodes.Delete(client, clusterID, d.Id()).ExtractErr(); err != nil {
 		return fmterr.Errorf("error deleting OpenTelekomCloud CCE Cluster: %w", err)
